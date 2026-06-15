@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: colab-orchestrator
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: API_SECRET
+        generateValue: true
+      - key: NODE_ENV
+        value: production
+      - key: MAX_SESSIONS
+        value: "3"
+    autoDeploy: true

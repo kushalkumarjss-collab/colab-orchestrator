@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Colab Code Runner - Execute Python on Google Colab</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>🚀 Google Colab Code Runner</h1>
+        <p>Execute Python code on Google Colab GPU instances via simple API</p>
+      </header>
+
+      <div class="api-key-section">
+        <label for="apiSecret">🔐 API Secret:</label>
+        <input
+          type="password"
+          id="apiSecret"
+          placeholder="Enter your API secret key"
+          autocomplete="off" />
+        <button id="saveApiKey">💾 Save</button>
+        <button id="clearApiKey" class="secondary">🗑️ Clear</button>
+      </div>
+
+      <div class="session-section">
+        <button id="startSession" disabled>🎬 Start New Session</button>
+        <button id="keepAliveBtn" disabled>💓 Keep Alive</button>
+        <button id="stopSession" disabled>🛑 Stop Session</button>
+        <div id="sessionInfo" class="session-info"></div>
+      </div>
+
+      <div class="code-section">
+        <div class="code-header">
+          <label>📝 Python Code:</label>
+          <div class="code-actions">
+            <button id="clearCode" class="small">Clear</button>
+            <button id="resetCode" class="small">Reset Example</button>
+          </div>
+        </div>
+        <textarea
+          id="codeEditor"
+          rows="12"
+          placeholder='print("Hello from Colab!")&#10;&#10;for i in range(5):&#10;    print(f"Step {i}")'></textarea>
+      </div>
+
+      <div class="execution-controls">
+        <button id="runSync" disabled>⚡ Run (Sync - Wait)</button>
+        <button id="runAsync" disabled>🔄 Run (Async - Poll)</button>
+        <div class="execution-status" id="execStatus"></div>
+      </div>
+
+      <div class="output-section">
+        <div class="output-header">
+          <label>📤 Output:</label>
+          <button id="copyOutput" class="small">📋 Copy</button>
+          <button id="clearOutput" class="small">🗑️ Clear</button>
+        </div>
+        <pre id="output">Ready to run code...</pre>
+      </div>
+
+      <div class="status-section">
+        <div id="status" class="status"></div>
+      </div>
+    </div>
+
+    <script src="script.js"></script>
+  </body>
+</html>
