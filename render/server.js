@@ -14,8 +14,8 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, '..')));
 
 // Configuration
-const API_SECRET = process.env.API_SECRET || "kushalkumarj234";
-const MAX_SESSIONS = 2; // Changed to 2 sessions max
+const API_SECRET = process.env.API_SECRET || "kushalkumarjthegreat";
+const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS) || 2;
 const SESSION_TIMEOUT = 2 * 60 * 60 * 1000; // 2 hours
 const EXECUTION_TIMEOUT = 3600; // 1 hour
 const MAX_CODE_SIZE = 1024 * 1024; // 1MB
@@ -24,37 +24,117 @@ const COMPLETED_EXECUTIONS_TTL = 5 * 60 * 1000; // 5 minutes
 // Session folders base directory
 const SESSIONS_BASE_DIR = path.join(os.tmpdir(), 'colab_sessions');
 
-// Find colab binary
-const COLAB_BINARY = findColabBinary();
+// Colab binary configuration
+let COLAB_BINARY = 'colab';
+let USE_PYTHON_MODULE = false;
 
-function findColabBinary() {
-    const possiblePaths = [
-        path.join(__dirname, 'colab'),
-        path.join(__dirname, 'bin', 'colab'),
-        path.join(__dirname, '..', 'bin', 'colab'),
-        '/usr/local/bin/colab',
-        '/usr/bin/colab',
-        process.env.COLAB_PATH
-    ].filter(Boolean);
+// Find colab binary recursively
+async function findColabBinaryRecursive() {
+    const { execSync } = require('child_process');
     
-    for (const p of possiblePaths) {
+    console.log('🔍 Searching for colab binary...');
+    
+    // Try to find via which command first
+    try {
+        const whichPath = execSync('which colab 2>/dev/null || echo ""', { encoding: 'utf8', timeout: 5000 }).trim();
+        if (whichPath && whichPath !== '') {
+            console.log(`✅ Found colab via which: ${whichPath}`);
+            return whichPath;
+        }
+    } catch(e) {}
+    
+    // Try to find via pip show
+    try {
+        const pipPath = execSync('pip3 show google-colab-cli | grep Location | cut -d" " -f2', { encoding: 'utf8', timeout: 5000 }).trim();
+        if (pipPath) {
+            console.log(`📦 pip location: ${pipPath}`);
+            const possibleBinary = `${pipPath}/colab_cli/__main__.py`;
+            if (require('fs').existsSync(possibleBinary)) {
+                console.log(`✅ Found colab via pip: ${possibleBinary}`);
+                return 'python3';
+            }
+        }
+    } catch(e) {}
+    
+    // Recursive search in common directories
+    const searchPaths = [
+        '/opt/render/.local/bin',
+        '/usr/local/bin', 
+        '/usr/bin',
+        '/opt/render/project/.local/bin',
+        '/home/render/.local/bin',
+        '/opt/render/project/src/.local/bin'
+    ];
+    
+    for (const searchPath of searchPaths) {
         try {
-            if (require('fs').existsSync(p)) {
-                console.log(`✅ Found colab at: ${p}`);
+            const result = execSync(`find ${searchPath} -name "colab" -type f 2>/dev/null | head -1`, { encoding: 'utf8', timeout: 10000 }).trim();
+            if (result && result !== '') {
+                console.log(`✅ Found colab via recursive search: ${result}`);
+                // Make it executable
                 try {
-                    const { execSync } = require('child_process');
-                    execSync(`chmod +x "${p}"`, { stdio: 'ignore' });
+                    execSync(`chmod +x "${result}"`, { stdio: 'ignore' });
                 } catch(e) {}
-                return p;
+                return result;
             }
         } catch(e) {}
     }
     
-    console.warn('⚠️ colab binary not found, will try system PATH');
-    return 'colab';
+    // Check if the existing binary is actually a Python script
+    const existingBinary = path.join(__dirname, 'colab');
+    if (require('fs').existsSync(existingBinary)) {
+        try {
+            const content = require('fs').readFileSync(existingBinary, 'utf8').slice(0, 200);
+            if (content.includes('python') || content.includes('#!/')) {
+                console.log(`✅ Existing binary is a Python script, using python3 -m colab_cli`);
+                return 'python3';
+            }
+        } catch(e) {}
+    }
+    
+    console.warn('⚠️ colab binary not found, will use python3 -m colab_cli');
+    return 'python3';
 }
 
-console.log(`🔧 Using colab binary: ${COLAB_BINARY}`);
+// Initialize colab binary
+async function initColabBinary() {
+    const binary = await findColabBinaryRecursive();
+    if (binary === 'python3') {
+        USE_PYTHON_MODULE = true;
+        COLAB_BINARY = 'python3';
+        console.log(`🔧 Using Python module: ${COLAB_BINARY} -m colab_cli`);
+    } else {
+        COLAB_BINARY = binary;
+        USE_PYTHON_MODULE = false;
+        console.log(`🔧 Using colab binary: ${COLAB_BINARY}`);
+    }
+}
+
+// Run colab CLI command
+async function runColabCli(args, timeout = 30000) {
+    return new Promise((resolve, reject) => {
+        let command;
+        
+        if (USE_PYTHON_MODULE) {
+            const escapedArgs = args.map(a => `"${a.replace(/"/g, '\\"')}"`).join(' ');
+            command = `${COLAB_BINARY} -m colab_cli ${escapedArgs}`;
+        } else {
+            const escapedArgs = args.map(a => `"${a.replace(/"/g, '\\"')}"`).join(' ');
+            command = `${COLAB_BINARY} ${escapedArgs}`;
+        }
+        
+        console.log(`Running: ${command}`);
+        
+        exec(command, { timeout, shell: '/bin/bash', maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
+            if (error && error.code !== 0) {
+                console.error(`Command failed: ${error.message}`);
+                reject({ error, stdout, stderr });
+            } else {
+                resolve({ stdout, stderr });
+            }
+        });
+    });
+}
 
 // Setup Colab authentication from environment token
 async function setupColabAuth() {
@@ -123,10 +203,8 @@ async function cleanupSessionFolder(sessionId) {
 async function cleanupAllSessionsAndCreateNew() {
     console.log('🧹 Cleaning up all sessions...');
     
-    // Get all current sessions
     const currentSessions = Array.from(sessions.keys());
     
-    // Stop all Colab sessions
     for (const sessionId of currentSessions) {
         const session = sessions.get(sessionId);
         if (session) {
@@ -137,10 +215,8 @@ async function cleanupAllSessionsAndCreateNew() {
         }
     }
     
-    // Clear sessions map
     sessions.clear();
     
-    // Clean up base directory
     try {
         await fs.rm(SESSIONS_BASE_DIR, { recursive: true, force: true });
         await fs.mkdir(SESSIONS_BASE_DIR, { recursive: true });
@@ -177,21 +253,6 @@ setInterval(() => {
     }
 }, 60 * 1000);
 
-async function runColabCli(args, timeout = 30000) {
-    return new Promise((resolve, reject) => {
-        console.log(`Running: ${COLAB_BINARY} ${args.join(' ')}`);
-        const { execFile } = require('child_process');
-        const proc = execFile(COLAB_BINARY, args, { timeout }, (error, stdout, stderr) => {
-            if (error) {
-                console.error(`Command failed: ${error.message}`);
-                reject({ error, stdout, stderr });
-            } else {
-                resolve({ stdout, stderr });
-            }
-        });
-    });
-}
-
 function generateSessionId() {
     return crypto.randomBytes(32).toString('hex');
 }
@@ -212,14 +273,19 @@ async function executeCodeInColab(sessionId, cellNo, code, executionId) {
         const codeFile = path.join(sessionFolder, `code_${cellNo}.py`);
         await fs.writeFile(codeFile, code, 'utf8');
         
-        // Escape code for shell
+        // Execute using stdin piping
         const escapedCode = code
             .replace(/\\/g, '\\\\')
             .replace(/`/g, '\\`')
             .replace(/\$/g, '\\$')
             .replace(/"/g, '\\"');
         
-        const command = `echo "${escapedCode}" | ${COLAB_BINARY} exec -s ${session.colabSession} --timeout ${EXECUTION_TIMEOUT}`;
+        let command;
+        if (USE_PYTHON_MODULE) {
+            command = `echo "${escapedCode}" | python3 -m colab_cli exec -s ${session.colabSession} --timeout ${EXECUTION_TIMEOUT}`;
+        } else {
+            command = `echo "${escapedCode}" | ${COLAB_BINARY} exec -s ${session.colabSession} --timeout ${EXECUTION_TIMEOUT}`;
+        }
         
         const result = await new Promise((resolve, reject) => {
             exec(command, { 
@@ -304,6 +370,7 @@ app.get('/health', (req, res) => {
         uptime: process.uptime(),
         timestamp: new Date().toISOString(),
         colabBinary: COLAB_BINARY,
+        usePythonModule: USE_PYTHON_MODULE,
         hasAuthToken: !!process.env.COLAB_AUTH_TOKEN
     });
 });
@@ -315,7 +382,6 @@ app.post('/start', async (req, res) => {
         return res.status(401).json({ error: 'Invalid API secret' });
     }
     
-    // Check if we need to cleanup old sessions
     if (sessions.size >= MAX_SESSIONS) {
         console.log(`Max sessions (${MAX_SESSIONS}) reached, cleaning up all sessions...`);
         await cleanupAllSessionsAndCreateNew();
@@ -325,10 +391,7 @@ app.post('/start', async (req, res) => {
     const colabSessionName = `colab_${sessionId.substring(0, 12)}`;
     
     try {
-        // Create session folder
         await createSessionFolder(sessionId);
-        
-        // Create Colab session
         await runColabCli(['new', '--gpu', 'T4', '-s', colabSessionName], 60000);
         
         sessions.set(sessionId, {
@@ -350,12 +413,9 @@ app.post('/start', async (req, res) => {
         
     } catch (error) {
         console.error('Session creation failed:', error.message);
-        
-        // Clean up on failure
         await cleanupSessionFolder(sessionId);
         
-        // Try to get auth URL
-        const child = spawn(COLAB_BINARY, ['new', '--gpu', 'T4', '-s', colabSessionName]);
+        const child = spawn(COLAB_BINARY, USE_PYTHON_MODULE ? ['-m', 'colab_cli', 'new', '--gpu', 'T4', '-s', colabSessionName] : ['new', '--gpu', 'T4', '-s', colabSessionName]);
         let authUrl = null;
         let outputBuffer = '';
         
@@ -601,9 +661,8 @@ async function cleanupIdleSessions() {
 
 // Initialize and start
 async function init() {
-    // Create base sessions directory
+    await initColabBinary();
     await fs.mkdir(SESSIONS_BASE_DIR, { recursive: true });
-    
     await setupColabAuth();
     setTimeout(cleanupIdleSessions, 60 * 60 * 1000);
     
@@ -612,9 +671,9 @@ async function init() {
         console.log(`\n🚀 Colab Orchestrator running on port ${PORT}`);
         console.log(`📁 Static files from: ${path.join(__dirname, '..')}`);
         console.log(`📁 Sessions folder: ${SESSIONS_BASE_DIR}`);
-        console.log(`🔧 Colab binary: ${COLAB_BINARY}`);
+        console.log(`🔧 Colab binary: ${COLAB_BINARY} ${USE_PYTHON_MODULE ? '(-m colab_cli)' : ''}`);
         console.log(`📊 Max sessions: ${MAX_SESSIONS}`);
-        console.log(`🔐 API Secret: ${API_SECRET !== 'kushalkumarj234' ? '✅ Custom' : '⚠️ Default'}`);
+        console.log(`🔐 API Secret: ${API_SECRET !== 'kushalkumarjthegreat' ? '✅ Custom' : '⚠️ Default'}`);
         console.log(`🔑 Colab Auth: ${process.env.COLAB_AUTH_TOKEN ? '✅ Token configured' : '⚠️ No token'}`);
         console.log(`\n🌐 Open: http://localhost:${PORT}`);
         console.log(`🔑 API Secret: ${API_SECRET}\n`);
