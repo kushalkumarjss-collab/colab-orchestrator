@@ -1,16 +1,18 @@
 services:
   - type: web
-    name: colab-orchestrator
+    name: repochat
     runtime: node
     plan: free
-    buildCommand: npm install
+    buildCommand: |
+      npm install
+      pip3 install google-colab-cli
     startCommand: npm start
-    healthCheckPath: /health
     envVars:
       - key: API_SECRET
-        generateValue: true
+        sync: false
+      - key: COLAB_AUTH_TOKEN
+        sync: false
+      - key: MAX_SESSIONS
+        value: "2"
       - key: NODE_ENV
         value: production
-      - key: MAX_SESSIONS
-        value: "3"
-    autoDeploy: true
