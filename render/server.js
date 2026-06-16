@@ -7,7 +7,6 @@ const path = require('path');
 const os = require('os');
 const cors = require('cors');
 require('dotenv').config();
-
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -16,10 +15,11 @@ app.use(express.static(path.join(__dirname, '..')));
 // Configuration
 const API_SECRET = process.env.API_SECRET || "kushalkumarjthegreat";
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS) || 2;
-const SESSION_TIMEOUT = 2 * 60 * 60 * 1000; // 2 hours
-const EXECUTION_TIMEOUT = 3600; // 1 hour
-const MAX_CODE_SIZE = 1024 * 1024; // 1MB
-const COMPLETED_EXECUTIONS_TTL = 5 * 60 * 1000; // 5 minutes
+const SESSION_TIMEOUT = 3 * 60 * 60 * 1000; // 3 hours
+const EXECUTION_TIMEOUT = 7200; // 2 hours
+const MAX_CODE_SIZE = 3*1024 * 1024; // 1MB
+const COMPLETED_EXECUTIONS_TTL = 10 * 60 * 1000; // 5 minutes
+const POLL_INTERVAL = 15000; // 15 seconds
 
 // Session folders base directory
 const SESSIONS_BASE_DIR = path.join(os.tmpdir(), 'colab_sessions');
@@ -31,10 +31,8 @@ let USE_PYTHON_MODULE = false;
 // Find colab binary recursively
 async function findColabBinaryRecursive() {
     const { execSync } = require('child_process');
-    
     console.log('🔍 Searching for colab binary...');
     
-    // Try to find via which command first
     try {
         const whichPath = execSync('which colab 2>/dev/null || echo ""', { encoding: 'utf8', timeout: 5000 }).trim();
         if (whichPath && whichPath !== '') {
@@ -42,8 +40,7 @@ async function findColabBinaryRecursive() {
             return whichPath;
         }
     } catch(e) {}
-    
-    // Try to find via pip show
+
     try {
         const pipPath = execSync('pip3 show google-colab-cli | grep Location | cut -d" " -f2', { encoding: 'utf8', timeout: 5000 }).trim();
         if (pipPath) {
@@ -55,8 +52,7 @@ async function findColabBinaryRecursive() {
             }
         }
     } catch(e) {}
-    
-    // Recursive search in common directories
+
     const searchPaths = [
         '/opt/render/.local/bin',
         '/usr/local/bin', 
@@ -71,7 +67,6 @@ async function findColabBinaryRecursive() {
             const result = execSync(`find ${searchPath} -name "colab" -type f 2>/dev/null | head -1`, { encoding: 'utf8', timeout: 10000 }).trim();
             if (result && result !== '') {
                 console.log(`✅ Found colab via recursive search: ${result}`);
-                // Make it executable
                 try {
                     execSync(`chmod +x "${result}"`, { stdio: 'ignore' });
                 } catch(e) {}
@@ -79,8 +74,7 @@ async function findColabBinaryRecursive() {
             }
         } catch(e) {}
     }
-    
-    // Check if the existing binary is actually a Python script
+
     const existingBinary = path.join(__dirname, 'colab');
     if (require('fs').existsSync(existingBinary)) {
         try {
@@ -91,7 +85,7 @@ async function findColabBinaryRecursive() {
             }
         } catch(e) {}
     }
-    
+
     console.warn('⚠️ colab binary not found, will use python3 -m colab_cli');
     return 'python3';
 }
@@ -114,7 +108,6 @@ async function initColabBinary() {
 async function runColabCli(args, timeout = 30000) {
     return new Promise((resolve, reject) => {
         let command;
-        
         if (USE_PYTHON_MODULE) {
             const escapedArgs = args.map(a => `"${a.replace(/"/g, '\\"')}"`).join(' ');
             command = `${COLAB_BINARY} -m colab_cli ${escapedArgs}`;
@@ -122,9 +115,7 @@ async function runColabCli(args, timeout = 30000) {
             const escapedArgs = args.map(a => `"${a.replace(/"/g, '\\"')}"`).join(' ');
             command = `${COLAB_BINARY} ${escapedArgs}`;
         }
-        
         console.log(`Running: ${command}`);
-        
         exec(command, { timeout, shell: '/bin/bash', maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
             if (error && error.code !== 0) {
                 console.error(`Command failed: ${error.message}`);
@@ -156,24 +147,21 @@ async function setupColabAuth() {
         
         const configDir = path.join(os.homedir(), '.config/colab-cli');
         await fs.mkdir(configDir, { recursive: true });
-        
         await fs.writeFile(
             path.join(configDir, 'token.json'), 
             JSON.stringify(tokenData, null, 2)
         );
         console.log('✅ Written token.json');
-        
+
         const sessionsConfig = {
             sessions: {},
             activeSession: null
         };
-        
         await fs.writeFile(
             path.join(configDir, 'sessions.json'), 
             JSON.stringify(sessionsConfig, null, 2)
         );
         console.log('✅ Written sessions.json');
-        
         return true;
     } catch (error) {
         console.error('❌ Auth setup failed:', error.message);
@@ -202,9 +190,7 @@ async function cleanupSessionFolder(sessionId) {
 // Clean up all sessions and start fresh
 async function cleanupAllSessionsAndCreateNew() {
     console.log('🧹 Cleaning up all sessions...');
-    
     const currentSessions = Array.from(sessions.keys());
-    
     for (const sessionId of currentSessions) {
         const session = sessions.get(sessionId);
         if (session) {
@@ -214,14 +200,11 @@ async function cleanupAllSessionsAndCreateNew() {
             await cleanupSessionFolder(sessionId);
         }
     }
-    
     sessions.clear();
-    
     try {
         await fs.rm(SESSIONS_BASE_DIR, { recursive: true, force: true });
         await fs.mkdir(SESSIONS_BASE_DIR, { recursive: true });
     } catch (error) {}
-    
     console.log('✅ All sessions cleaned up');
 }
 
@@ -242,6 +225,7 @@ function extractApiSecret(req) {
 const sessions = new Map();
 const executionQueue = new Set();
 const completedExecutions = new Map();
+const executionProcesses = new Map(); // Track execution processes for stopping
 
 // Cleanup completed executions periodically
 setInterval(() => {
@@ -257,50 +241,95 @@ function generateSessionId() {
     return crypto.randomBytes(32).toString('hex');
 }
 
+// Execute code with streaming output capture
 async function executeCodeInColab(sessionId, cellNo, code, executionId) {
     const session = sessions.get(sessionId);
     if (!session) throw new Error('Session not found');
 
     const startedAt = Date.now();
+    let process = null;
     
     try {
         if (Buffer.byteLength(code, 'utf8') > MAX_CODE_SIZE) {
             throw new Error(`Code exceeds ${MAX_CODE_SIZE} bytes`);
         }
-        
+
         // Save code to session folder
         const sessionFolder = path.join(SESSIONS_BASE_DIR, sessionId);
         const codeFile = path.join(sessionFolder, `code_${cellNo}.py`);
         await fs.writeFile(codeFile, code, 'utf8');
-        
+
         // Execute using stdin piping
         const escapedCode = code
             .replace(/\\/g, '\\\\')
             .replace(/`/g, '\\`')
             .replace(/\$/g, '\\$')
             .replace(/"/g, '\\"');
-        
+
         let command;
         if (USE_PYTHON_MODULE) {
             command = `echo "${escapedCode}" | python3 -m colab_cli exec -s ${session.colabSession} --timeout ${EXECUTION_TIMEOUT}`;
         } else {
             command = `echo "${escapedCode}" | ${COLAB_BINARY} exec -s ${session.colabSession} --timeout ${EXECUTION_TIMEOUT}`;
         }
-        
+
+        // Store process reference for stop functionality
+        process = exec(command, { 
+            timeout: EXECUTION_TIMEOUT * 1000, 
+            maxBuffer: 50 * 1024 * 1024,
+            shell: '/bin/bash'
+        });
+
+        // Store process reference
+        executionProcesses.set(executionId, process);
+
+        // Capture output incrementally
+        let stdout = '';
+        let stderr = '';
+        let hasOutput = false;
+
+        process.stdout.on('data', (data) => {
+            const chunk = data.toString();
+            stdout += chunk;
+            hasOutput = true;
+            
+            // Update session with partial output for polling
+            const currentSession = sessions.get(sessionId);
+            if (currentSession && currentSession.currentExecution?.executionId === executionId) {
+                currentSession.currentExecution.partialOutput = stdout;
+                currentSession.currentExecution.partialError = stderr;
+                sessions.set(sessionId, currentSession);
+            }
+        });
+
+        process.stderr.on('data', (data) => {
+            const chunk = data.toString();
+            stderr += chunk;
+            hasOutput = true;
+            
+            const currentSession = sessions.get(sessionId);
+            if (currentSession && currentSession.currentExecution?.executionId === executionId) {
+                currentSession.currentExecution.partialOutput = stdout;
+                currentSession.currentExecution.partialError = stderr;
+                sessions.set(sessionId, currentSession);
+            }
+        });
+
+        // Wait for process to complete
         const result = await new Promise((resolve, reject) => {
-            exec(command, { 
-                timeout: EXECUTION_TIMEOUT * 1000, 
-                maxBuffer: 50 * 1024 * 1024,
-                shell: '/bin/bash'
-            }, (error, stdout, stderr) => {
-                if (error && error.code !== 0) {
-                    reject({ error, stdout, stderr });
+            process.on('close', (code) => {
+                if (code !== 0) {
+                    reject({ error: new Error(`Process exited with code ${code}`), stdout, stderr });
                 } else {
                     resolve({ stdout, stderr });
                 }
             });
+            
+            process.on('error', (err) => {
+                reject({ error: err, stdout, stderr });
+            });
         });
-        
+
         const completedAt = Date.now();
         const output = { 
             status: 'completed', 
@@ -310,8 +339,9 @@ async function executeCodeInColab(sessionId, cellNo, code, executionId) {
             completedAt,
             executionTime: completedAt - startedAt
         };
-
+        
         completedExecutions.set(executionId, output);
+        executionProcesses.delete(executionId);
 
         const updatedSession = sessions.get(sessionId);
         if (updatedSession && updatedSession.currentExecution?.executionId === executionId) {
@@ -319,9 +349,8 @@ async function executeCodeInColab(sessionId, cellNo, code, executionId) {
             updatedSession.status = 'ready';
             sessions.set(sessionId, updatedSession);
         }
-        
+
         return output;
-        
     } catch (error) {
         const completedAt = Date.now();
         const failureResult = {
@@ -332,8 +361,8 @@ async function executeCodeInColab(sessionId, cellNo, code, executionId) {
             completedAt,
             executionTime: completedAt - startedAt
         };
-
         completedExecutions.set(executionId, failureResult);
+        executionProcesses.delete(executionId);
 
         const updatedSession = sessions.get(sessionId);
         if (updatedSession && updatedSession.currentExecution?.executionId === executionId) {
@@ -342,6 +371,33 @@ async function executeCodeInColab(sessionId, cellNo, code, executionId) {
             sessions.set(sessionId, updatedSession);
         }
         throw error;
+    }
+}
+
+// Stop execution
+async function stopExecution(sessionId, executionId) {
+    const session = sessions.get(sessionId);
+    if (!session) {
+        throw new Error('Session not found');
+    }
+
+    const process = executionProcesses.get(executionId);
+    if (process) {
+        process.kill('SIGINT'); // Send Ctrl+C equivalent
+        executionProcesses.delete(executionId);
+        
+        // Update session status
+        session.currentExecution = null;
+        session.status = 'ready';
+        sessions.set(sessionId, session);
+        
+        return { success: true, message: 'Execution stopped' };
+    } else {
+        // Check if already completed
+        if (completedExecutions.has(executionId)) {
+            return { success: true, message: 'Execution already completed' };
+        }
+        throw new Error('Execution process not found');
     }
 }
 
@@ -377,19 +433,18 @@ app.get('/health', (req, res) => {
 
 app.post('/start', async (req, res) => {
     const apiSecret = extractApiSecret(req);
-    
     if (!validateApiSecret(apiSecret)) {
         return res.status(401).json({ error: 'Invalid API secret' });
     }
-    
+
     if (sessions.size >= MAX_SESSIONS) {
         console.log(`Max sessions (${MAX_SESSIONS}) reached, cleaning up all sessions...`);
         await cleanupAllSessionsAndCreateNew();
     }
-    
+
     const sessionId = generateSessionId();
     const colabSessionName = `colab_${sessionId.substring(0, 12)}`;
-    
+
     try {
         await createSessionFolder(sessionId);
         await runColabCli(['new', '--gpu', 'T4', '-s', colabSessionName], 60000);
@@ -402,7 +457,7 @@ app.post('/start', async (req, res) => {
             currentExecution: null,
             folder: path.join(SESSIONS_BASE_DIR, sessionId)
         });
-        
+
         res.json({
             success: true,
             sessionId: sessionId,
@@ -410,7 +465,6 @@ app.post('/start', async (req, res) => {
             expiresIn: SESSION_TIMEOUT,
             message: 'Session created successfully'
         });
-        
     } catch (error) {
         console.error('Session creation failed:', error.message);
         await cleanupSessionFolder(sessionId);
@@ -418,7 +472,6 @@ app.post('/start', async (req, res) => {
         const child = spawn(COLAB_BINARY, USE_PYTHON_MODULE ? ['-m', 'colab_cli', 'new', '--gpu', 'T4', '-s', colabSessionName] : ['new', '--gpu', 'T4', '-s', colabSessionName]);
         let authUrl = null;
         let outputBuffer = '';
-        
         const timeout = setTimeout(() => {
             if (!authUrl) {
                 child.kill();
@@ -428,7 +481,7 @@ app.post('/start', async (req, res) => {
                 });
             }
         }, 10000);
-        
+
         const handleOutput = (data) => {
             outputBuffer += data.toString();
             const match = outputBuffer.match(/https:\/\/accounts\.google\.com\/o\/oauth2\/auth[^\s]+/);
@@ -436,7 +489,6 @@ app.post('/start', async (req, res) => {
                 authUrl = match[0].split('"')[0].split("'")[0].split('\n')[0];
                 clearTimeout(timeout);
                 child.kill();
-                
                 res.json({
                     success: false,
                     needsAuth: true,
@@ -445,10 +497,9 @@ app.post('/start', async (req, res) => {
                 });
             }
         };
-        
+
         child.stdout.on('data', handleOutput);
         child.stderr.on('data', handleOutput);
-        
         child.on('error', (err) => {
             clearTimeout(timeout);
             if (!authUrl) {
@@ -460,21 +511,20 @@ app.post('/start', async (req, res) => {
 
 app.post('/keepalive', async (req, res) => {
     const apiSecret = extractApiSecret(req);
-    
     if (!validateApiSecret(apiSecret)) {
         return res.status(401).json({ error: 'Invalid API secret' });
     }
-    
+
     const { sessionId } = req.body;
     if (!sessionId) {
         return res.status(400).json({ error: 'sessionId required' });
     }
-    
+
     const session = sessions.get(sessionId);
     if (!session) {
         return res.status(404).json({ error: 'Session not found' });
     }
-    
+
     try {
         await runColabCli(['sessions'], 10000);
         session.lastActivity = Date.now();
@@ -485,84 +535,89 @@ app.post('/keepalive', async (req, res) => {
     }
 });
 
+// Run endpoint - always async
 app.post('/run', async (req, res) => {
     const apiSecret = extractApiSecret(req);
-    
     if (!validateApiSecret(apiSecret)) {
         return res.status(401).json({ error: 'Invalid API secret' });
     }
-    
-    const { sessionId, code, cellNo, responseWait = false } = req.body;
-    
+
+    const { sessionId, code, cellNo } = req.body;
     if (!sessionId || !code || cellNo === undefined) {
         return res.status(400).json({ error: 'Missing required fields: sessionId, code, cellNo' });
     }
-    
+
     const session = sessions.get(sessionId);
     if (!session) {
         return res.status(404).json({ error: 'Session not found' });
     }
-    
+
     if (session.status === 'busy') {
         return res.status(409).json({ 
             error: 'Session busy',
             currentExecution: session.currentExecution
         });
     }
-    
+
     const executionId = crypto.randomBytes(16).toString('hex');
     const validCellNo = parseInt(cellNo, 10);
-    
+
     session.status = 'busy';
     session.lastActivity = Date.now();
     session.currentExecution = {
         executionId: executionId,
         cellNo: validCellNo,
         startedAt: Date.now(),
-        status: 'running'
+        status: 'running',
+        partialOutput: '',
+        partialError: ''
     };
     sessions.set(sessionId, session);
-    
-    if (responseWait === true) {
-        backgroundExecution(sessionId, validCellNo, code, executionId);
-        return res.json({
-            status: 'processing',
-            sessionId: sessionId,
-            executionId: executionId,
-            pollInterval: 2000,
-            message: 'Code execution started. Poll /status for results.'
-        });
+
+    // Start background execution
+    backgroundExecution(sessionId, validCellNo, code, executionId);
+
+    res.json({
+        status: 'processing',
+        sessionId: sessionId,
+        executionId: executionId,
+        pollInterval: POLL_INTERVAL,
+        message: 'Code execution started. Poll /status for results.'
+    });
+});
+
+// Stop execution endpoint
+app.post('/stop-execution', async (req, res) => {
+    const apiSecret = extractApiSecret(req);
+    if (!validateApiSecret(apiSecret)) {
+        return res.status(401).json({ error: 'Invalid API secret' });
     }
-    
+
+    const { sessionId, executionId } = req.body;
+    if (!sessionId || !executionId) {
+        return res.status(400).json({ error: 'Missing required fields: sessionId, executionId' });
+    }
+
     try {
-        const result = await executeCodeInColab(sessionId, validCellNo, code, executionId);
-        res.json({
-            success: true,
-            output: result.output,
-            error: result.error,
-            executionTime: result.executionTime
-        });
+        const result = await stopExecution(sessionId, executionId);
+        res.json(result);
     } catch (error) {
-        res.status(500).json({ 
-            error: 'Execution failed', 
-            details: error.message 
-        });
+        res.status(500).json({ error: error.message });
     }
 });
 
 app.post('/status', async (req, res) => {
     const apiSecret = extractApiSecret(req);
-    
     if (!validateApiSecret(apiSecret)) {
         return res.status(401).json({ error: 'Invalid API secret' });
     }
-    
+
     const { sessionId, executionId } = req.body;
-    
     if (!sessionId || !executionId) {
         return res.status(400).json({ error: 'Missing required fields: sessionId, executionId' });
     }
-    
+
+    // Check if completed
     if (completedExecutions.has(executionId)) {
         const record = completedExecutions.get(executionId);
         return res.json({
@@ -572,20 +627,23 @@ app.post('/status', async (req, res) => {
             executionTime: record.executionTime
         });
     }
-    
+
     const session = sessions.get(sessionId);
     if (!session) {
         return res.status(404).json({ error: 'Session not found' });
     }
-    
+
     const execution = session.currentExecution;
     if (execution && execution.executionId === executionId) {
+        // Return partial output if available
         return res.json({
             status: 'running',
-            elapsed: Date.now() - execution.startedAt
+            elapsed: Date.now() - execution.startedAt,
+            partialOutput: execution.partialOutput || '',
+            partialError: execution.partialError || ''
         });
     }
-    
+
     res.json({ 
         status: 'not_found',
         message: 'Execution not found or already completed'
@@ -594,11 +652,10 @@ app.post('/status', async (req, res) => {
 
 app.post('/status/ack', async (req, res) => {
     const apiSecret = extractApiSecret(req);
-    
     if (!validateApiSecret(apiSecret)) {
         return res.status(401).json({ error: 'Invalid API secret' });
     }
-    
+
     const { executionId } = req.body;
     if (executionId && completedExecutions.has(executionId)) {
         completedExecutions.delete(executionId);
@@ -610,17 +667,16 @@ app.post('/status/ack', async (req, res) => {
 
 app.delete('/session/:sessionId', async (req, res) => {
     const apiSecret = extractApiSecret(req);
-    
     if (!validateApiSecret(apiSecret)) {
         return res.status(401).json({ error: 'Invalid API secret' });
     }
-    
+
     const { sessionId } = req.params;
     const session = sessions.get(sessionId);
     if (!session) {
         return res.status(404).json({ error: 'Session not found' });
     }
-    
+
     try {
         await runColabCli(['stop', '-s', session.colabSession], 30000);
         await cleanupSessionFolder(sessionId);
@@ -640,7 +696,6 @@ app.delete('/session/:sessionId', async (req, res) => {
 async function cleanupIdleSessions() {
     const now = Date.now();
     let cleaned = 0;
-    
     for (const [sessionId, session] of sessions.entries()) {
         if (now - session.lastActivity > SESSION_TIMEOUT && session.status !== 'busy') {
             try {
@@ -651,11 +706,9 @@ async function cleanupIdleSessions() {
             sessions.delete(sessionId);
         }
     }
-    
     if (cleaned > 0) {
         console.log(`Cleaned up ${cleaned} idle sessions`);
     }
-    
     setTimeout(cleanupIdleSessions, 60 * 60 * 1000);
 }
 
@@ -665,7 +718,7 @@ async function init() {
     await fs.mkdir(SESSIONS_BASE_DIR, { recursive: true });
     await setupColabAuth();
     setTimeout(cleanupIdleSessions, 60 * 60 * 1000);
-    
+
     const PORT = process.env.PORT || 3000;
     app.listen(PORT, () => {
         console.log(`\n🚀 Colab Orchestrator running on port ${PORT}`);
@@ -675,6 +728,8 @@ async function init() {
         console.log(`📊 Max sessions: ${MAX_SESSIONS}`);
         console.log(`🔐 API Secret: ${API_SECRET !== 'kushalkumarjthegreat' ? '✅ Custom' : '⚠️ Default'}`);
         console.log(`🔑 Colab Auth: ${process.env.COLAB_AUTH_TOKEN ? '✅ Token configured' : '⚠️ No token'}`);
+        console.log(`⏰ Session timeout: ${SESSION_TIMEOUT / 1000 / 60 / 60} hours`);
+        console.log(`⏱️  Execution timeout: ${EXECUTION_TIMEOUT / 60} minutes`);
         console.log(`\n🌐 Open: http://localhost:${PORT}`);
         console.log(`🔑 API Secret: ${API_SECRET}\n`);
     });
