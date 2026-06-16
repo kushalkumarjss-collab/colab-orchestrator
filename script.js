@@ -1,14 +1,12 @@
 // Configuration
 let API_BASE = '';
 
-// Detect API base URL (adjust if backend is on different port)
+// Detect API base URL
 if (window.location.port === '3000' || window.location.port === '') {
     API_BASE = window.location.origin;
 } else {
-    // If frontend is on different port (like 5500), backend is on 3000
     API_BASE = `${window.location.protocol}//${window.location.hostname}:3000`;
 }
-
 console.log('API Base URL:', API_BASE);
 
 // State
@@ -16,6 +14,7 @@ let currentSessionId = null;
 let currentExecutionId = null;
 let pollInterval = null;
 let keepAliveInterval = null;
+let isPolling = false;
 
 // DOM Elements
 const apiSecretInput = document.getElementById('apiSecret');
@@ -24,8 +23,8 @@ const clearApiKeyBtn = document.getElementById('clearApiKey');
 const startSessionBtn = document.getElementById('startSession');
 const keepAliveBtn = document.getElementById('keepAliveBtn');
 const stopSessionBtn = document.getElementById('stopSession');
-const runSyncBtn = document.getElementById('runSync');
 const runAsyncBtn = document.getElementById('runAsync');
+const stopExecutionBtn = document.getElementById('stopExecution');
 const clearCodeBtn = document.getElementById('clearCode');
 const resetCodeBtn = document.getElementById('resetCode');
 const copyOutputBtn = document.getElementById('copyOutput');
@@ -41,17 +40,14 @@ const EXAMPLE_CODE = `# Test Colab GPU and Python features
 import torch
 import sys
 import time
-
 print("=" * 50)
 print("Python version:", sys.version.split()[0])
 print("PyTorch version:", torch.__version__)
 print("CUDA available:", torch.cuda.is_available())
-
 if torch.cuda.is_available():
     print("GPU:", torch.cuda.get_device_name(0))
     print("GPU Count:", torch.cuda.device_count())
     print("=" * 50)
-    
     # Simple GPU computation
     print("\\nRunning GPU computation...")
     start = time.time()
@@ -68,9 +64,7 @@ else:
     end = time.time()
     print(f"Sum of 10M numbers: {result}")
     print(f"Time taken: {(end-start):.2f} seconds")
-
-print("\\n✅ Code execution completed successfully!");
-`;
+print("\\n✅ Code execution completed successfully!");`;
 
 // Load saved API key
 const savedApiKey = localStorage.getItem('apiSecret');
@@ -135,39 +129,41 @@ startSessionBtn.addEventListener('click', async () => {
         showStatus('Please save your API key first', 'error');
         return;
     }
-    
+
     startSessionBtn.disabled = true;
     startSessionBtn.textContent = 'Starting...';
-    
+
     try {
         const response = await fetch(`${API_BASE}/start`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ api_secret: apiSecret })
         });
-        
         const data = await response.json();
-        
+
         if (data.success) {
             currentSessionId = data.sessionId;
             sessionInfo.innerHTML = `
                 <strong>✅ Session Active</strong><br>
                 Session ID: <code>${data.sessionId.substring(0, 32)}...</code><br>
-                🔐 Auth URL: <a href="${data.authUrl}" target="_blank">Authenticate with Google</a><br>
-                ⏰ Expires in: ${Math.floor(data.expiresIn / 1000 / 60)} minutes<br>
+                ${data.authUrl ? `🔐 Auth URL: <a href="${data.authUrl}" target="_blank">Authenticate with Google</a><br>` : ''}
+                ⏰ Expires in: ${Math.floor(data.expiresIn / 1000 / 60 / 60)} hours<br>
                 📡 API Base: ${API_BASE}
             `;
             sessionInfo.classList.add('active');
-            runSyncBtn.disabled = false;
             runAsyncBtn.disabled = false;
             keepAliveBtn.disabled = false;
             stopSessionBtn.disabled = false;
-            showStatus('✅ Session created! Please authenticate with Google.', 'success');
-            
-            // Start keepalive
+            showStatus('✅ Session created!', 'success');
             startKeepAlive(apiSecret);
         } else {
-            showStatus(`Error: ${data.error}`, 'error');
+            showStatus(`Error: ${data.error || data.message || 'Unknown error'}`, 'error');
+            if (data.authUrl) {
+                sessionInfo.innerHTML = `
+                    🔐 Please authenticate: <a href="${data.authUrl}" target="_blank">Authenticate with Google</a>
+                `;
+                sessionInfo.classList.add('active');
+            }
         }
     } catch (error) {
         console.error('Start error:', error);
@@ -181,10 +177,8 @@ startSessionBtn.addEventListener('click', async () => {
 // Keep session alive
 function startKeepAlive(apiSecret) {
     if (keepAliveInterval) clearInterval(keepAliveInterval);
-    
     keepAliveInterval = setInterval(async () => {
         if (!currentSessionId) return;
-        
         try {
             const response = await fetch(`${API_BASE}/keepalive`, {
                 method: 'POST',
@@ -194,11 +188,9 @@ function startKeepAlive(apiSecret) {
                     api_secret: apiSecret
                 })
             });
-            
             const data = await response.json();
             if (data.success) {
                 console.log('Keepalive sent');
-                execStatus.textContent = `💓 Last ping: ${new Date().toLocaleTimeString()}`;
             }
         } catch (error) {
             console.error('Keepalive failed:', error);
@@ -210,10 +202,10 @@ function startKeepAlive(apiSecret) {
 keepAliveBtn.addEventListener('click', async () => {
     const apiSecret = apiSecretInput.value.trim();
     if (!currentSessionId || !apiSecret) return;
-    
+
     keepAliveBtn.disabled = true;
     keepAliveBtn.textContent = 'Pinging...';
-    
+
     try {
         const response = await fetch(`${API_BASE}/keepalive`, {
             method: 'POST',
@@ -223,7 +215,6 @@ keepAliveBtn.addEventListener('click', async () => {
                 api_secret: apiSecret
             })
         });
-        
         const data = await response.json();
         if (data.success) {
             showStatus('Session kept alive!', 'success');
@@ -239,76 +230,27 @@ keepAliveBtn.addEventListener('click', async () => {
     }
 });
 
-// Run synchronous
-runSyncBtn.addEventListener('click', async () => {
-    const apiSecret = apiSecretInput.value.trim();
-    const code = codeEditor.value.trim();
-    
-    if (!code) {
-        showStatus('Please enter some code to run', 'warning');
-        return;
-    }
-    
-    runSyncBtn.disabled = true;
-    runAsyncBtn.disabled = true;
-    outputDiv.textContent = '⏳ Running code synchronously...\nPlease wait for completion...';
-    showStatus('Executing code (synchronous mode)...', 'info');
-    execStatus.textContent = '⚡ Running synchronously...';
-    
-    try {
-        const response = await fetch(`${API_BASE}/run`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                sessionId: currentSessionId,
-                code: code,
-                cellNo: 1,
-                responseWait: false,
-                api_secret: apiSecret
-            })
-        });
-        
-        const data = await response.json();
-        
-        if (data.success) {
-            outputDiv.textContent = data.output || '(No output)';
-            if (data.error) {
-                outputDiv.textContent += '\n\n--- Error Stream ---\n' + data.error;
-            }
-            showStatus(`✅ Execution completed in ${(data.executionTime / 1000).toFixed(2)} seconds`, 'success');
-            execStatus.textContent = `✅ Complete (${(data.executionTime / 1000).toFixed(1)}s)`;
-        } else {
-            outputDiv.textContent = `Error: ${data.error}\n${data.details || ''}`;
-            showStatus(`Execution failed: ${data.error}`, 'error');
-            execStatus.textContent = '❌ Failed';
-        }
-    } catch (error) {
-        outputDiv.textContent = `Connection error: ${error.message}`;
-        showStatus('Connection error', 'error');
-        execStatus.textContent = '❌ Connection error';
-    } finally {
-        runSyncBtn.disabled = false;
-        runAsyncBtn.disabled = false;
-        setTimeout(() => { execStatus.textContent = ''; }, 3000);
-    }
-});
-
 // Run async with polling
 runAsyncBtn.addEventListener('click', async () => {
     const apiSecret = apiSecretInput.value.trim();
     const code = codeEditor.value.trim();
-    
+
     if (!code) {
         showStatus('Please enter some code to run', 'warning');
         return;
     }
-    
-    runSyncBtn.disabled = true;
+
+    if (!currentSessionId) {
+        showStatus('Please start a session first', 'warning');
+        return;
+    }
+
     runAsyncBtn.disabled = true;
+    stopExecutionBtn.disabled = false;
     outputDiv.textContent = '🔄 Starting async execution...';
     showStatus('Starting async execution...', 'info');
     execStatus.textContent = '🔄 Starting...';
-    
+
     try {
         const response = await fetch(`${API_BASE}/run`, {
             method: 'POST',
@@ -317,48 +259,100 @@ runAsyncBtn.addEventListener('click', async () => {
                 sessionId: currentSessionId,
                 code: code,
                 cellNo: 1,
-                responseWait: true,
                 api_secret: apiSecret
             })
         });
-        
         const data = await response.json();
-        
+
         if (data.status === 'processing') {
             currentExecutionId = data.executionId;
-            outputDiv.textContent = `🚀 Execution started!\n📋 Execution ID: ${currentExecutionId}\n⏱️  Polling for results every ${data.pollInterval}ms...\n\nWaiting for completion...`;
+            outputDiv.textContent = `🚀 Execution started!\n📋 Execution ID: ${currentExecutionId}\n⏱️  Polling for results every ${data.pollInterval/1000} seconds...\n\nWaiting for completion...`;
             showStatus('Code running in background, polling for results...', 'info');
             execStatus.textContent = '🔄 Polling for results...';
-            
-            // Start polling
             startPolling(apiSecret);
         } else {
-            outputDiv.textContent = `Error: ${data.error}`;
+            outputDiv.textContent = `Error: ${data.error || 'Unknown error'}`;
             showStatus('Failed to start execution', 'error');
             execStatus.textContent = '❌ Failed to start';
-            runSyncBtn.disabled = false;
             runAsyncBtn.disabled = false;
+            stopExecutionBtn.disabled = true;
         }
     } catch (error) {
         outputDiv.textContent = `Connection error: ${error.message}`;
         showStatus('Connection error', 'error');
         execStatus.textContent = '❌ Connection error';
-        runSyncBtn.disabled = false;
         runAsyncBtn.disabled = false;
+        stopExecutionBtn.disabled = true;
     }
 });
 
-// Poll for results
+// Stop execution
+stopExecutionBtn.addEventListener('click', async () => {
+    if (!currentSessionId || !currentExecutionId) return;
+
+    if (!confirm('⚠️ Are you sure you want to stop the current execution?\nThis will terminate the running cell.')) return;
+
+    const apiSecret = apiSecretInput.value.trim();
+    stopExecutionBtn.disabled = true;
+    stopExecutionBtn.textContent = 'Stopping...';
+
+    try {
+        const response = await fetch(`${API_BASE}/stop-execution`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                sessionId: currentSessionId,
+                executionId: currentExecutionId,
+                api_secret: apiSecret
+            })
+        });
+        const data = await response.json();
+
+        if (data.success) {
+            showStatus('✅ Execution stopped', 'success');
+            execStatus.textContent = '⏹️ Stopped';
+            outputDiv.textContent += '\n\n--- ⏹️ Execution stopped by user ---';
+            
+            // Clear polling
+            if (pollInterval) {
+                clearInterval(pollInterval);
+                pollInterval = null;
+            }
+            isPolling = false;
+            currentExecutionId = null;
+            runAsyncBtn.disabled = false;
+            stopExecutionBtn.disabled = true;
+            
+            // Update session state
+            const session = sessions.get(currentSessionId);
+            if (session) {
+                session.status = 'ready';
+                session.currentExecution = null;
+                sessions.set(currentSessionId, session);
+            }
+        } else {
+            showStatus(`Error: ${data.error}`, 'error');
+        }
+    } catch (error) {
+        showStatus(`Error: ${error.message}`, 'error');
+    } finally {
+        stopExecutionBtn.disabled = false;
+        stopExecutionBtn.textContent = '⏹️ Stop Execution';
+    }
+});
+
+// Poll for results with incremental output
 function startPolling(apiSecret) {
     if (pollInterval) clearInterval(pollInterval);
-    
+    isPolling = true;
     let attempts = 0;
-    const maxAttempts = 180; // 6 minutes max (2s * 180 = 360s)
+    const maxAttempts = 720; // 3 hours max (15s * 720 = 3 hours)
     const startTime = Date.now();
-    
+
     pollInterval = setInterval(async () => {
         attempts++;
-        
+        if (!isPolling) return;
+
         try {
             const response = await fetch(`${API_BASE}/status`, {
                 method: 'POST',
@@ -369,64 +363,77 @@ function startPolling(apiSecret) {
                     api_secret: apiSecret
                 })
             });
-            
             const data = await response.json();
-            
+
             if (data.status === 'completed') {
                 clearInterval(pollInterval);
+                isPolling = false;
                 outputDiv.textContent = data.output || '(No output)';
                 if (data.error) {
                     outputDiv.textContent += '\n\n--- Error Stream ---\n' + data.error;
                 }
-                showStatus(`✅ Async execution completed in ${(data.executionTime / 1000).toFixed(2)} seconds`, 'success');
+                showStatus(`✅ Execution completed in ${(data.executionTime / 1000).toFixed(2)} seconds`, 'success');
                 execStatus.textContent = `✅ Complete (${(data.executionTime / 1000).toFixed(1)}s)`;
-                runSyncBtn.disabled = false;
                 runAsyncBtn.disabled = false;
+                stopExecutionBtn.disabled = true;
                 currentExecutionId = null;
                 pollInterval = null;
             } else if (data.status === 'failed') {
                 clearInterval(pollInterval);
+                isPolling = false;
                 outputDiv.textContent = `❌ Execution failed: ${data.error}`;
                 showStatus('Execution failed', 'error');
                 execStatus.textContent = '❌ Failed';
-                runSyncBtn.disabled = false;
                 runAsyncBtn.disabled = false;
+                stopExecutionBtn.disabled = true;
                 currentExecutionId = null;
                 pollInterval = null;
             } else if (data.status === 'running') {
                 const elapsed = (data.elapsed / 1000).toFixed(1);
-                outputDiv.textContent = `🏃 Running... (${elapsed} seconds elapsed)\nExecution ID: ${currentExecutionId}\n\nWaiting for completion...`;
+                // Update output with partial results
+                let outputText = `🏃 Running... (${elapsed} seconds elapsed)\nExecution ID: ${currentExecutionId}\n\n`;
+                if (data.partialOutput) {
+                    outputText += '--- Partial Output ---\n' + data.partialOutput;
+                }
+                if (data.partialError) {
+                    outputText += '\n\n--- Partial Error Stream ---\n' + data.partialError;
+                }
+                if (!data.partialOutput && !data.partialError) {
+                    outputText += 'Waiting for output...';
+                }
+                outputDiv.textContent = outputText;
                 execStatus.textContent = `🏃 Running (${elapsed}s)`;
             }
-            
+
             if (attempts >= maxAttempts) {
                 clearInterval(pollInterval);
+                isPolling = false;
                 outputDiv.textContent = '⏰ Polling timeout - execution may still be running\nCheck session status manually.';
                 showStatus('Polling timeout', 'warning');
                 execStatus.textContent = '⏰ Timeout';
-                runSyncBtn.disabled = false;
                 runAsyncBtn.disabled = false;
+                stopExecutionBtn.disabled = true;
                 pollInterval = null;
             }
         } catch (error) {
             console.error('Polling error:', error);
             if (attempts >= maxAttempts) {
                 clearInterval(pollInterval);
+                isPolling = false;
                 pollInterval = null;
             }
         }
-    }, 2000); // Poll every 2 seconds
+    }, 15000); // Poll every 15 seconds
 }
 
 // Stop session
 stopSessionBtn.addEventListener('click', async () => {
     if (!confirm('⚠️ Are you sure you want to terminate this session?\nAll running code will be stopped.')) return;
-    
+
     const apiSecret = apiSecretInput.value.trim();
-    
     stopSessionBtn.disabled = true;
     stopSessionBtn.textContent = 'Terminating...';
-    
+
     try {
         const response = await fetch(`${API_BASE}/session/${currentSessionId}`, {
             method: 'DELETE',
@@ -435,22 +442,20 @@ stopSessionBtn.addEventListener('click', async () => {
                 'api-secret': apiSecret
             }
         });
-        
         const data = await response.json();
-        
+
         if (data.success) {
-            // Clean up intervals
             if (keepAliveInterval) clearInterval(keepAliveInterval);
             if (pollInterval) clearInterval(pollInterval);
-            
+            isPolling = false;
             currentSessionId = null;
             currentExecutionId = null;
             sessionInfo.classList.remove('active');
             sessionInfo.innerHTML = '';
-            runSyncBtn.disabled = true;
             runAsyncBtn.disabled = true;
             keepAliveBtn.disabled = true;
             stopSessionBtn.disabled = true;
+            stopExecutionBtn.disabled = true;
             outputDiv.textContent = 'Session terminated. Start a new session to run code.';
             showStatus('✅ Session terminated successfully', 'success');
             execStatus.textContent = '';
@@ -469,8 +474,6 @@ stopSessionBtn.addEventListener('click', async () => {
 function showStatus(message, type) {
     statusDiv.textContent = message;
     statusDiv.className = `status ${type}`;
-    
-    // Auto-hide after 5 seconds
     setTimeout(() => {
         if (statusDiv.textContent === message) {
             statusDiv.classList.add('fade-out');
@@ -502,7 +505,6 @@ async function checkHealth() {
         showStatus(`⚠️ Cannot connect to backend at ${API_BASE}. Make sure server is running.`, 'warning');
     }
 }
-
 checkHealth();
 
 // Auto-refresh session info every 30 seconds
